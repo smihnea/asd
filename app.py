@@ -1,21 +1,49 @@
 #!/usr/bin/env python3
 """
-Excel Consolidator - Advanced Excel File Processing Application
-==============================================================
+Excel Consolidator - Aplicație Avansată de Procesare Fișiere Excel
+==================================================================
 
-VERSION: 1.1
-LAST UPDATED: August 2025
+CONTEXT PENTRU ASISTENȚII LLM:
+==============================
+Aceasta este o aplicație desktop de producție care consolidează multiple fișiere Excel (.xlsx/.xlsm)
+cu structuri de tabele similare într-un workbook unificat cu două foi de output specializate:
+1. "Cumulative" - Vedere secvențială a tuturor datelor cu urmărire sursă
+2. "Centralizator" - Articole deduplicate cu cantități agregate și nivele de stoc
 
-Changes vs 1.0:
-- Thread-safe UI updates via Queue + root.after
-- Determinate progress with cancel support
-- Overwrite prompt and full-path display
-- Robust EU number parsing; correct aggregation with weighted PU
-- Faster, indexed fuzzy stock matching
-- Copy merged cells, freeze panes, auto-filter
-- No stale workbook handles; try/finally cleanup
-- Safer header mapping; optional “RON” in headers
-- Blocks legacy .xls selection
+Aplicația gestionează documente de business românești cu detecție inteligentă de headere,
+validare de date, integrare stoc prin potrivire fuzzy și păstrează formatarea originală.
+Zone de focus cheie: flexibilitate mapare headere, reguli de validare date, algoritmi de potrivire stoc,
+și formatare output Excel. Vezi DOCUMENTATION.md pentru detalii tehnice complete.
+
+PREZENTARE GENERALĂ ARHITECTURĂ:
+===============================
+- ExcelProcessorGUI: UI bazat pe Tkinter cu suport threading
+- ExcelProcessor: Logică de business centrală cu pipeline de procesare modular
+- Metode cheie: process_files(), extract_data_from_sheet(), create_centralizator_data()
+- Flux de date: Încărcare fișiere → Detecție headere → Extragere date → Integrare stoc → 
+  Consolidare → Generare Centralizator → Output Excel cu păstrare formatare
+
+GHID DE MODIFICARE:
+===================
+- Menține compatibilitatea înapoi cu utilizatorii existenți
+- Testează temeinic cu fișiere eșantion (în special "Oferta Consolight_M.xlsx")
+- Extinde funcționalitatea incremental în loc să rescrii logica de bază
+- Actualizează DOCUMENTATION.md când adaugi funcționalități noi
+- Concentrează-te pe îmbunătățirea mapării headerelor, regulilor de validare și potrivirii stocului
+
+VERSIUNE: 1.1
+ULTIMA ACTUALIZARE: August 2025
+
+Schimbări față de 1.0:
+- Actualizări UI thread-safe prin Queue + root.after
+- Progress determinate cu suport anulare
+- Prompt suprasciere și afișare cale completă
+- Parsing robust numere EU; agregare corectă cu PU ponderat
+- Potrivire fuzzy stoc mai rapidă, indexată
+- Copiază celule îmbinate, freeze panes, auto-filter
+- Fără handle-uri workbook stagnante; cleanup try/finally
+- Mapare headere mai sigură; "RON" opțional în headere
+- Blochează selecția .xls legacy
 
 """
 
@@ -333,7 +361,7 @@ class ExcelProcessor:
         self.centralizator_headers = [
             'Descriere', 'Denumire', 'Cod articol', 'Furnizor', 'Cantitate',
             'P.U.\n(RON)', 'Pret total\n(RON)',
-            'P.U. Taxa\nVerde (RON)', 'Pret total Taxa\nVerde (RON)', 'Stoc'
+            'P.U. Taxa\nVerde (RON)', 'Pret total Taxa\nVerde (RON)', 'Stoc', 'Cod - Stoc'
         ]
         self.source_sheets: List[Dict[str, str]] = []
         self.stock_data: Dict[str, float] = {}
@@ -380,6 +408,27 @@ class ExcelProcessor:
             if nk.endswith(key) or f" {key} " in f" {nk} ":
                 return v
         return 0.0
+
+    def find_stock_code(self, cod_articol: str) -> str:
+        """Find and return the original stock code that matches the given article code."""
+        if not cod_articol or not self.stock_data:
+            return ""
+        key = self._normalize_code(cod_articol)
+        
+        # Check exact match first - return the original key from stock_data
+        for original_stock_code in self.stock_data.keys():
+            if self._normalize_code(original_stock_code) == key:
+                return original_stock_code
+        
+        # Fuzzy matching - return the original stock code that matches
+        bucket = self._stock_by_suffix.get(key[-6:] if len(key) >= 6 else key, [])
+        for nk, v in bucket:
+            if nk.endswith(key) or f" {key} " in f" {nk} ":
+                # Find the original stock code that corresponds to this normalized key
+                for original_stock_code in self.stock_data.keys():
+                    if self._normalize_code(original_stock_code) == nk:
+                        return original_stock_code
+        return ""
 
     # --------------- Main pipeline ---------------
 
@@ -659,12 +708,31 @@ class ExcelProcessor:
     def _create_centralizator_data(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         from collections import defaultdict
         grouped = defaultdict(list)
+        items_without_code_grouped = defaultdict(list)  # Group items without codes by description
+        
         for it in rows:
             code = str(it.get('Cod articol', '') or '').strip()
             if code:
                 grouped[code].append(it)
+            else:
+                # Group items without code by their description/name
+                desc = str(it.get('Descriere', '') or '').strip()
+                if desc:
+                    items_without_code_grouped[desc].append(it)
+                else:
+                    # If no description either, use denomination
+                    denom = str(it.get('Denumire', '') or '').strip()
+                    key = denom if denom else "NO_IDENTIFIER"
+                    items_without_code_grouped[key].append(it)
 
         out: List[Dict[str, Any]] = []
+        
+        # Helper function for weighted average
+        def wavg(pairs: List[Tuple[float, float]]) -> float:
+            total_q = sum(q for _, q in pairs)
+            return round(sum(p * q for p, q in pairs) / total_q, 6) if total_q else 0.0
+        
+        # Process grouped items (with codes)
         for code, items in grouped.items():
             sum_qty = 0.0
             sum_total = 0.0
@@ -689,10 +757,6 @@ class ExcelProcessor:
                 if tpu is not None:
                     tpu_pairs.append((tpu, q))
 
-            def wavg(pairs: List[Tuple[float, float]]) -> float:
-                total_q = sum(q for _, q in pairs)
-                return round(sum(p * q for p, q in pairs) / total_q, 6) if total_q else 0.0
-
             p_u = wavg(pu_pairs)
             p_u_taxa = wavg(tpu_pairs)
 
@@ -700,6 +764,7 @@ class ExcelProcessor:
             qty_val = int(sum_qty) if abs(sum_qty - int(sum_qty)) < 1e-9 else round(sum_qty, 6)
 
             stock_qty = self.find_stock_quantity(code)
+            stock_code = self.find_stock_code(code)
 
             out.append({
                 'Descriere': base.get('Descriere', ''),
@@ -711,7 +776,53 @@ class ExcelProcessor:
                 'Pret total\n(RON)': round(sum_total, 6),
                 'P.U. Taxa\nVerde (RON)': p_u_taxa,
                 'Pret total Taxa\nVerde (RON)': round(sum_tax_total, 6),
-                'Stoc': stock_qty
+                'Stoc': stock_qty,
+                'Cod - Stoc': stock_code
+            })
+        
+        # Process grouped items without codes (aggregated by description/name)
+        for desc_key, items in items_without_code_grouped.items():
+            sum_qty = 0.0
+            sum_total = 0.0
+            sum_tax_total = 0.0
+            pu_pairs: List[Tuple[float, float]] = []
+            tpu_pairs: List[Tuple[float, float]] = []
+
+            base = items[0]
+
+            for it in items:
+                q = to_float(it.get('Cantitate')) or 0.0
+                pu = to_float(it.get('P.U.\n(RON)'))
+                tot = to_float(it.get('Pret total\n(RON)'))
+                tpu = to_float(it.get('P.U. Taxa\nVerde (RON)'))
+                ttot = to_float(it.get('Pret total Taxa\nVerde (RON)'))
+
+                sum_qty += q
+                sum_total += (tot if tot is not None else ((pu or 0.0) * q))
+                sum_tax_total += (ttot if ttot is not None else ((tpu or 0.0) * q))
+                if pu is not None:
+                    pu_pairs.append((pu, q))
+                if tpu is not None:
+                    tpu_pairs.append((tpu, q))
+
+            p_u = wavg(pu_pairs)
+            p_u_taxa = wavg(tpu_pairs)
+
+            # convert qty to int if whole
+            qty_val = int(sum_qty) if abs(sum_qty - int(sum_qty)) < 1e-9 else round(sum_qty, 6)
+
+            out.append({
+                'Descriere': base.get('Descriere', ''),
+                'Denumire': base.get('Denumire', ''),
+                'Cod articol': '',  # Empty since no code
+                'Furnizor': base.get('Furnizor', ''),
+                'Cantitate': qty_val,
+                'P.U.\n(RON)': p_u,
+                'Pret total\n(RON)': round(sum_total, 6),
+                'P.U. Taxa\nVerde (RON)': p_u_taxa,
+                'Pret total Taxa\nVerde (RON)': round(sum_tax_total, 6),
+                'Stoc': 0.0,  # No stock match possible without code
+                'Cod - Stoc': ''  # No stock code match possible without code
             })
 
         out.sort(key=lambda x: (x.get('Cod articol', ''), x.get('Descriere', '')))
@@ -856,6 +967,8 @@ class ExcelProcessor:
                         cell.number_format = '#,##0.00'
                 if h == 'Cod articol':
                     cell.fill = PatternFill(start_color="F0F8FF", end_color="F0F8FF", fill_type="solid")
+                if h == 'Cod - Stoc':
+                    cell.fill = PatternFill(start_color="E6F3FF", end_color="E6F3FF", fill_type="solid")
 
         # autosize
         for c in range(1, len(self.centralizator_headers) + 1):
